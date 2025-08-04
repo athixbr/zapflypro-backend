@@ -3,121 +3,105 @@ global.crypto = crypto;
 
 const express = require('express');
 const app = express(); 
-const multer = require('multer');
-
 const http = require('http').createServer(app); 
 const P = require('pino');
-const mysql = require('mysql2/promise');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const qrImage = require('qr-image');
 const { join } = require('path');
 const fs = require('fs');
 const cors = require('cors');
+const mysql = require('mysql2/promise');
+const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
+const path = require('path');
+const Redis = require('ioredis');
+const multer = require('multer');
 
-const processQueue = async () => {
-  while (true) {
-    try {
-      const rawMessage = await redis.rpop('message_queue');
-
-      if (!rawMessage) {
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        continue;
-      }
-
-      const msg = JSON.parse(rawMessage);
-      const { userId, groupId, caption, column, scheduledTime } = msg;
-
-      // Fallback para recuperar o filePath correto
-      const finalFilePath = msg.filePath || msg.image_url || msg.video_url || msg.document_url || msg.audio_url;
-      const finalColumn = column || (msg.image_url ? 'image_url'
-                                    : msg.video_url ? 'video_url'
-                                    : msg.document_url ? 'document_url'
-                                    : msg.audio_url ? 'audio_url'
-                                    : null);
-
-      if (!userId || !groupId || !finalFilePath || !finalColumn) {
-        console.error(`❌ Parâmetros ausentes ou inválidos: ${JSON.stringify(msg)}`);
-        continue;
-      }
-
-      // Montar payload de envio com base na mídia
-      let payload;
-      if (finalColumn === 'image_url') {
-        payload = { image: { url: finalFilePath }, caption, jpegThumbnail: Buffer.alloc(0) };
-      } else if (finalColumn === 'video_url') {
-        payload = { video: { url: finalFilePath }, caption };
-      } else if (finalColumn === 'audio_url') {
-        payload = { audio: { url: finalFilePath }, caption };
-      } else {
-        payload = { document: { url: finalFilePath }, caption };
-      }
-
-      try {
-        await sock.sendMessage(groupId, payload);
-        console.log(`✅ Mensagem enviada para grupo ${groupId}`);
-
-        const connection = await dbPool.getConnection();
-        await connection.execute(
-          'UPDATE messages_queue SET status = ?, error = NULL WHERE user_id = ? AND group_id = ? AND (image_url = ? OR video_url = ? OR audio_url = ? OR document_url = ?)',
-          ['sent', userId, groupId, msg.image_url, msg.video_url, msg.audio_url, msg.document_url]
-        );
-        connection.release();
-
-      } catch (sendError) {
-        console.error(`❌ Erro ao enviar para grupo ${groupId}: ${sendError.message}`);
-
-        if (sendError.message.includes('Connection Closed') || sendError.message.includes('Timed Out')) {
-          console.log('🔁 Tentando reconectar e reenviar...');
-          await connectToWhatsApp();
-          await new Promise(r => setTimeout(r, 10000));
-
-          try {
-            await sock.sendMessage(groupId, payload);
-            console.log(`✅ Reenvio bem-sucedido após reconexão para ${groupId}`);
-          } catch (finalError) {
-            console.error(`❌ Falha após reconexão: ${finalError.message}`);
-          }
-        }
-
-        const connection = await dbPool.getConnection();
-        await connection.execute(
-          'UPDATE messages_queue SET status = ?, error = ? WHERE user_id = ? AND group_id = ? AND (image_url = ? OR video_url = ? OR audio_url = ? OR document_url = ?)',
-          [
-            'failed',
-            sendError.message ?? 'Erro desconhecido',
-            userId ?? null,
-            groupId ?? null,
-            msg.image_url ?? null,
-            msg.video_url ?? null,
-            msg.audio_url ?? null,
-            msg.document_url ?? null
-          ]
-        );
-
-        connection.release();
-      }
-
-      // Delay entre cada mensagem (AUMENTADO para mais de 2 minutos)
-      await new Promise(resolve => setTimeout(resolve, 130000)); // 130000 ms = 2 minutos e 10 segundos
-
-    } catch (err) {
-      console.error('❌ Erro inesperado na fila:', err);
-      await new Promise(resolve => setTimeout(resolve, 10000));
-    }
-  }
-};
-
-// Configuração do storage do multer para salvar arquivos em /uploads/files
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, 'uploads/files');
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + '-' + file.originalname);
-  }
+const redis = new Redis({
+  host: 'vps.iryd.com.br',        // ou IP do servidor Redis
+  port: 6379,               // porta padrão do Redis
+  password: 'pent2530@MT'
 });
 
+
+
+const clients = []; // Armazena conexões ativas para SSE
+
+// 🔥 Aqui você cola o novo bloco:
+const metadataCache = new Map(); // Cache na RAM
+const METADATA_CACHE_TTL = 86400; // 24 horas
+
+let isWhatsAppConnected = false;
+
+async function getGroupMetadataSafe(groupId) {
+    // Primeiro, tenta pelo cache em memória RAM
+    if (metadataCache.has(groupId)) {
+        console.log(`📦 (RAM) Metadados de cache para ${groupId}`);
+        return metadataCache.get(groupId);
+    }
+
+    // Depois, tenta no Redis
+    const redisKey = `group-metadata:${groupId}`;
+    let redisData = await redis.get(redisKey);
+
+    if (redisData) {
+        console.log(`📦 (REDIS) Metadados de cache para ${groupId}`);
+        const parsedMetadata = JSON.parse(redisData);
+        metadataCache.set(groupId, parsedMetadata);
+        return parsedMetadata;
+    }
+
+    try {
+        // Se não achar nem no RAM nem no Redis, busca do WhatsApp
+        console.log(`🌐 Buscando metadados do grupo ${groupId} do WhatsApp`);
+        const metadata = await sock.groupMetadata(groupId);
+
+        // Salva no RAM
+        metadataCache.set(groupId, metadata);
+
+        // Salva no Redis com expiração
+        await redis.set(redisKey, JSON.stringify(metadata), 'EX', METADATA_CACHE_TTL);
+
+        // Pequeno delay para respeitar o WhatsApp
+        await new Promise(res => setTimeout(res, 1500));
+
+        return metadata;
+    } catch (error) {
+        console.error(`⚠️ Falha ao sincronizar grupo ${groupId}: ${error.message}`);
+        throw error;
+    }
+}
+
+
+
+
+app.use(cors());
+app.use(express.json());
+
+// Existing storage configuration
+// Configuração do multer
+const storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+        let folder;
+        if (file.mimetype.startsWith('image/')) {
+            folder = 'uploads/images/';
+        } else if (file.mimetype.startsWith('video/')) {
+            folder = 'uploads/videos/';
+        } else {
+            folder = 'uploads/files/';
+        }
+
+        // Verifica se a pasta existe, se não, cria
+        if (!fs.existsSync(folder)) {
+            fs.mkdirSync(folder, { recursive: true });
+        }
+
+        cb(null, folder);
+    },
+    filename: function (req, file, cb) {
+        cb(null, Date.now() + path.extname(file.originalname));
+    }
+});
 const upload = multer({ storage: storage });
 
 
