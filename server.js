@@ -2,11 +2,10 @@ const crypto = require('crypto');
 global.crypto = crypto;
 
 const express = require('express');
-const app = express(); // ⬅️ precisa vir primeiro
-const http = require('http').createServer(app); // ⬅️ agora está correto
+const app = express(); 
+const http = require('http').createServer(app); 
 const P = require('pino');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, makeInMemoryStore } = require('@whiskeysockets/baileys');
-
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const qrImage = require('qr-image');
 const { join } = require('path');
 const fs = require('fs');
@@ -16,9 +15,13 @@ const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const path = require('path');
 const Redis = require('ioredis');
-const redis = new Redis();
 const multer = require('multer');
 
+const redis = new Redis({
+  host: 'vps.iryd.com.br',        // ou IP do servidor Redis
+  port: 6379,               // porta padrão do Redis
+  password: 'pent2530@MT'
+});
 
 
 
@@ -27,6 +30,8 @@ const clients = []; // Armazena conexões ativas para SSE
 // 🔥 Aqui você cola o novo bloco:
 const metadataCache = new Map(); // Cache na RAM
 const METADATA_CACHE_TTL = 86400; // 24 horas
+
+let isWhatsAppConnected = false;
 
 async function getGroupMetadataSafe(groupId) {
     // Primeiro, tenta pelo cache em memória RAM
@@ -69,6 +74,7 @@ async function getGroupMetadataSafe(groupId) {
 
 
 
+
 app.use(cors());
 app.use(express.json());
 
@@ -108,6 +114,7 @@ const io = require('socket.io')(http, {
 const wsMensagensController = require('./controllers/wsMensagensController');
 const wsContatosController = require('./controllers/wsContatosController');
 
+
 wsMensagensController.initWebSocket(io);
 wsContatosController.initWebSocketContato(io);
 
@@ -118,10 +125,13 @@ global.wsBroadcastContato = wsContatosController.emitirMensagemContato;
 
 const SECRET_KEY = 'your-secret-key';
 
+
+
+
 let dbPool;
 async function connectToDatabase() {
     dbPool = await mysql.createPool({
-        host: 'localhost',
+        host: 'vps.iryd.com.br',
         user: 'zapfly-dev',
         password: 'drpLeyHPitikZ267',
         database: 'zapfly-dev',
@@ -148,8 +158,8 @@ async function safeQuery(query, params = []) {
 }
 
 
-const store = makeInMemoryStore({});
 let sock = null;
+
 let authState = null;
 let saveCreds = null;
 
@@ -172,13 +182,11 @@ sock = makeWASocket({
     auth: authState,
     printQRInTerminal: true,
     syncFullHistory: true,
+    logger: P({ level: 'silent' }),
     shouldIgnoreJid: jid => {
-    if (!jid || typeof jid !== 'string') return true;
-    return jid.startsWith('status@broadcast') || jid.includes('spam');
-},
-
-
-
+        if (!jid || typeof jid !== 'string') return true;
+        return jid.startsWith('status@broadcast') || jid.includes('spam');
+    },
     patchMessageBeforeSending: (message) => {
         const requiresPatch = !!(
             message.buttonsMessage ||
@@ -203,27 +211,58 @@ sock = makeWASocket({
 });
 
 
+
 sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr } = update;
 
-    if (connection === 'close') {
-        const shouldReconnect =
-            lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+    if (qr) {
+        console.log('📱 QR Code recebido. Gerando imagem...');
+        const qrCodeImage = qrImage.imageSync(qr, { type: 'png' });
+        const qrPath = path.join(__dirname, 'qr-code.png');
+        fs.writeFileSync(qrPath, qrCodeImage);
+        console.log('✅ QR Code salvo em:', qrPath);
+    }
 
-        console.log('Connection closed. Reconnect?', shouldReconnect);
+    switch (connection) {
+        case 'open':
+            isWhatsAppConnected = true;
+            console.log('✅ Conectado com sucesso ao WhatsApp');
+            break;
 
-        if (shouldReconnect) {
-            await connectToWhatsApp();
-        }
-    } else if (connection === 'open') {
-        console.log('Conectado com sucesso ao WhatsApp');
+        case 'close':
+            isWhatsAppConnected = false;
+
+            const isLoggedOut = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
+            const shouldReconnect = !isLoggedOut;
+
+            console.warn(`⚠️ Conexão com o WhatsApp fechada. Reconnect? ${shouldReconnect}`);
+
+            if (shouldReconnect) {
+                console.log('⏳ Aguardando 10 segundos antes de tentar reconectar...');
+                setTimeout(async () => {
+                    try {
+                        await connectToWhatsApp();
+                        console.log('🔄 Tentativa de reconexão realizada');
+                    } catch (err) {
+                        console.error('❌ Falha ao tentar reconectar:', err.message);
+                    }
+                }, 10000);
+            } else {
+                console.log('🛑 Sessão encerrada (logout). Apague a pasta auth_info_baileys para reconectar.');
+            }
+            break;
+
+        default:
+            console.log(`ℹ️ Estado da conexão: ${connection}`);
     }
 });
 
 
 
 
-       store.bind(sock.ev);
+
+
+
 sock.ev.on('creds.update', saveCreds);
 
 let sessionWasOpen = false;
@@ -710,6 +749,79 @@ app.post('/reprocess-connection-closed', async (req, res) => {
 });
 
 
+app.get('/all-group-messages', verifyJWT, async (req, res) => {
+    try {
+        const connection = await dbPool.getConnection();
+
+        const [rows] = await connection.execute(`
+            SELECT 
+                id,
+                group_id,
+                sender_id,
+                message,
+                image_url,
+                video_url,
+                document_url,
+                audio_url,
+                timestamp,
+                profile_picture_url
+            FROM messages1
+            ORDER BY timestamp DESC
+            LIMIT 1000
+        `);
+
+        connection.release();
+
+        res.json(rows);
+    } catch (error) {
+        console.error('Erro ao buscar todas as mensagens dos grupos:', error);
+        res.status(500).send('Erro interno ao buscar mensagens');
+    }
+});
+
+app.get('/health', async (req, res) => {
+    const status = {
+        redis: false,
+        mysql: false,
+        whatsapp: false,
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString()
+    };
+
+    try {
+        // Testar Redis
+        const pong = await redis.ping();
+        if (pong === 'PONG') status.redis = true;
+    } catch (err) {
+        console.error('Redis falhou:', err.message);
+    }
+
+    try {
+        // Testar MySQL
+        const connection = await dbPool.getConnection();
+        await connection.ping();
+        connection.release();
+        status.mysql = true;
+    } catch (err) {
+        console.error('MySQL falhou:', err.message);
+    }
+
+    try {
+        // Testar conexão com o WhatsApp
+        status.whatsapp = sock && sock.ws && sock.ws.readyState === 1;
+    } catch (err) {
+        console.error('Erro ao verificar WhatsApp:', err.message);
+    }
+
+    const allOk = status.redis && status.mysql && status.whatsapp;
+    res.status(allOk ? 200 : 500).json(status);
+});
+
+
+
+
+
+
 
 app.post('/library/upload', verifyJWT, upload.array('files'), async (req, res) => {
   const userId = req.userId;
@@ -812,17 +924,61 @@ function broadcastLiveMessage(data) {
 
 
 app.get('/qr-page', (req, res) => {
-    const qrPath = join(__dirname, 'qr-code.png');
-    if (!fs.existsSync(qrPath)) return res.send('QR Code ainda não foi gerado.');
+    const qrPath = path.join(__dirname, 'qr-code.png');
+
+    if (!fs.existsSync(qrPath)) {
+        return res.send(`
+            <html>
+                <body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;">
+                    <div>
+                        <h2>⚠️ QR Code ainda não foi gerado.</h2>
+                        <p>Certifique-se de que a sessão foi encerrada e aguarde alguns segundos...</p>
+                        <button onclick="location.reload()">🔄 Recarregar</button>
+                    </div>
+                </body>
+            </html>
+        `);
+    }
+
+    const timestamp = Date.now();
 
     res.send(`
         <html>
-            <body style="display:flex;justify-content:center;align-items:center;height:100vh;">
-                <img src="/qr" alt="QR Code" />
+            <body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f4;">
+                <div style="text-align:center;">
+                    <h2>📱 Escaneie o QR Code abaixo:</h2>
+                    <img src="/qr?t=${timestamp}" alt="QR Code" style="border:1px solid #000;" />
+                    <br><br>
+                    <button onclick="location.reload()">🔄 Atualizar QR</button>
+                </div>
             </body>
         </html>
     `);
 });
+
+app.get('/qr', (req, res) => {
+    const qrPath = path.join(__dirname, 'qr-code.png');
+    if (fs.existsSync(qrPath)) {
+        res.setHeader('Content-Type', 'image/png');
+        res.sendFile(qrPath);
+    } else {
+        res.status(404).send('QR Code não encontrado.');
+    }
+});
+
+
+app.get('/qr', (req, res) => {
+    const qrPath = path.join(__dirname, 'qr-code.png');
+    if (fs.existsSync(qrPath)) {
+        res.setHeader('Content-Type', 'image/png');
+        res.sendFile(qrPath);
+    } else {
+        res.status(404).send('QR Code não encontrado.');
+    }
+});
+
+
+
 
 
 
@@ -1220,37 +1376,23 @@ app.get('/schedules', async (req, res) => {
     
     // Outras rotas e middlewares...
     // Rota para obter o histórico
-    app.get('/history', verifyJWT, async (req, res) => {
-        const userId = req.userId;
+app.get('/history', verifyJWT, async (req, res) => {
+    const userId = req.userId;
 
-        try {
-            const connection = await dbPool.getConnection();
-            const [rows] = await connection.execute(`
-                SELECT 
-                    mq.id, 
-                    mq.group_id, 
-                    g.group_name, 
-                    mq.image_url, 
-                    mq.caption, 
-                    mq.status, 
-                    mq.error, 
-                    mq.created_at 
-                FROM 
-                    messages_queue mq 
-                LEFT JOIN 
-                    group_ids g 
-                ON 
-                    mq.group_id = g.group_id 
-                WHERE 
-                    mq.user_id = ?
-            `, [userId]);
-            connection.release();
-            res.json(rows);
-        } catch (error) {
-            console.error('Error fetching history:', error);
-            res.status(500).send('An error occurred while fetching history');
-        }
-    });
+    try {
+        const connection = await dbPool.getConnection();
+        const [rows] = await connection.execute(`
+            SELECT * FROM messages_queue WHERE user_id = ?
+        `, [userId]);
+        connection.release();
+        res.json(rows);
+    } catch (error) {
+        console.error('Error fetching history:', error);
+        res.status(500).send('An error occurred while fetching history');
+    }
+});
+
+
 
     app.get('/message/:id', verifyJWT, async (req, res) => {
         const { id } = req.params;
@@ -1971,31 +2113,42 @@ app.post('/forcar-disparos', verifyJWT, async (req, res) => {
 }
 
 // Chamando a função init para inicializar a aplicação
-init();
-(async () => {
-  const connectionClosedMessages = await safeQuery(
-"SELECT * FROM messages_queue WHERE status = 'failed' AND error LIKE '%Connection Closed%'"
-  );
+// Chama a inicialização principal
+init().then(() => {
+    // Após init, reprocessa mensagens pendentes
+    (async () => {
+        try {
+            const connectionClosedMessages = await safeQuery(
+                "SELECT * FROM messages_queue WHERE status = 'failed' AND error LIKE '%Connection Closed%'"
+            );
 
-  for (let msg of connectionClosedMessages) {
-    const payload = {
-      userId: msg.user_id,
-      groupId: msg.group_id,
-      filePath: msg.file_path || msg.image_url || msg.video_url || msg.document_url || msg.audio_url,
-      caption: msg.caption,
-      column: msg.image_url ? 'image_url' :
-              msg.video_url ? 'video_url' :
-              msg.document_url ? 'document_url' :
-              msg.audio_url ? 'audio_url' : null,
-      status: msg.status,
-      scheduledTime: msg.scheduled_time
-    };
+            for (let msg of connectionClosedMessages) {
+                const payload = {
+                    userId: msg.user_id,
+                    groupId: msg.group_id,
+                    filePath: msg.file_path || msg.image_url || msg.video_url || msg.document_url || msg.audio_url,
+                    caption: msg.caption,
+                    column: msg.image_url ? 'image_url' :
+                            msg.video_url ? 'video_url' :
+                            msg.document_url ? 'document_url' :
+                            msg.audio_url ? 'audio_url' : null,
+                    status: msg.status,
+                    scheduledTime: msg.scheduled_time
+                };
 
-    if (payload.filePath && payload.column) {
-      await redis.lpush('message_queue', JSON.stringify(payload));
-    }
-  }
+                if (payload.filePath && payload.column) {
+                    await redis.lpush('message_queue', JSON.stringify(payload));
+                }
+            }
 
-console.log(`🔄 ${connectionClosedMessages.length} mensagens com erro 'Connection Closed' reenfileiradas ao iniciar.`);
-})();
+            console.log(`🔄 ${connectionClosedMessages.length} mensagens com erro 'Connection Closed' reenfileiradas ao iniciar.`);
+        } catch (err) {
+            console.error('❌ Erro ao reenfileirar mensagens com erro:', err);
+        }
+    })();
+}).catch(err => {
+    console.error('❌ Erro ao inicializar o sistema:', err);
+});
+
+
 
