@@ -5,7 +5,8 @@ const express = require('express');
 const app = express(); 
 const http = require('http').createServer(app); 
 const P = require('pino');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys');
+const { connectToWhatsApp, getSock } = require('./connectToWhatsApp'); // Importar função de conexão
 const qrImage = require('qr-image');
 const { join } = require('path');
 const fs = require('fs');
@@ -13,7 +14,8 @@ const cors = require('cors');
 const mysql = require('mysql2/promise');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
-const path = require('path');
+// Importar funções de database.js
+const { safeQuery, getDbPool, connectToDatabase } = require('./database');
 const Redis = require('ioredis');
 const multer = require('multer');
 
@@ -29,57 +31,20 @@ const clients = []; // Armazena conexões ativas para SSE
 
 // 🔥 Aqui você cola o novo bloco:
 const metadataCache = new Map(); // Cache na RAM
-const METADATA_CACHE_TTL = 86400; // 24 horas
+// ...existing code...
+// ...existing code...
+// ...existing code...
 
-let isWhatsAppConnected = false;
 
-async function getGroupMetadataSafe(groupId) {
-    // Primeiro, tenta pelo cache em memória RAM
-    if (metadataCache.has(groupId)) {
-        console.log(`📦 (RAM) Metadados de cache para ${groupId}`);
-        return metadataCache.get(groupId);
-    }
 
-    // Depois, tenta no Redis
-    const redisKey = `group-metadata:${groupId}`;
-    let redisData = await redis.get(redisKey);
-
-    if (redisData) {
-        console.log(`📦 (REDIS) Metadados de cache para ${groupId}`);
-        const parsedMetadata = JSON.parse(redisData);
-        metadataCache.set(groupId, parsedMetadata);
-        return parsedMetadata;
-    }
-
-    try {
-        // Se não achar nem no RAM nem no Redis, busca do WhatsApp
-        console.log(`🌐 Buscando metadados do grupo ${groupId} do WhatsApp`);
-        const metadata = await sock.groupMetadata(groupId);
-
-        // Salva no RAM
-        metadataCache.set(groupId, metadata);
-
-        // Salva no Redis com expiração
-        await redis.set(redisKey, JSON.stringify(metadata), 'EX', METADATA_CACHE_TTL);
-
-        // Pequeno delay para respeitar o WhatsApp
-        await new Promise(res => setTimeout(res, 1500));
-
-        return metadata;
-    } catch (error) {
-        console.error(`⚠️ Falha ao sincronizar grupo ${groupId}: ${error.message}`);
-        throw error;
-    }
+// Função para registrar logs em arquivo
+function logToFile(message) {
+    const logPath = path.join(__dirname, 'whatsapp-connection.log');
+    const timestamp = new Date().toISOString();
+    fs.appendFileSync(logPath, `[${timestamp}] ${message}\n`);
 }
 
-
-
-
-app.use(cors());
-app.use(express.json());
-
-// Existing storage configuration
-// Configuração do multer
+// Configuração do multer para upload de arquivos
 const storage = multer.diskStorage({
     destination: function (req, file, cb) {
         let folder;
@@ -105,261 +70,19 @@ const storage = multer.diskStorage({
 const upload = multer({ storage: storage });
 
 
-const io = require('socket.io')(http, {
-    cors: {
-        origin: '*',
-    }
-});
-
-const wsMensagensController = require('./controllers/wsMensagensController');
-const wsContatosController = require('./controllers/wsContatosController');
-
-
-wsMensagensController.initWebSocket(io);
-wsContatosController.initWebSocketContato(io);
-
-// Disponibiliza globalmente, caso precise usar no futuro
-global.wsBroadcastGrupo = wsMensagensController.emitirMensagemGrupo;
-global.wsBroadcastContato = wsContatosController.emitirMensagemContato;
-
-
-const SECRET_KEY = 'your-secret-key';
 
 
 
 
-let dbPool;
-async function connectToDatabase() {
-    dbPool = await mysql.createPool({
-        host: 'vps.iryd.com.br',
-        user: 'zapfly-dev',
-        password: 'drpLeyHPitikZ267',
-        database: 'zapfly-dev',
-        charset: 'utf8mb4', 
-        waitForConnections: true,
-        connectionLimit: 500,
-        queueLimit: 0
-    });
-}
-connectToDatabase();
+// ...existing code...
 
-async function safeQuery(query, params = []) {
-    let connection;
-    try {
-        connection = await dbPool.getConnection();
-        const [results] = await connection.execute(query, params);
-        return results;
-    } catch (error) {
-        console.error('Erro ao executar query:', error);
-        throw error;
-    } finally {
-        if (connection) connection.release();
-    }
-}
+// ...existing code...
 
-
-let sock = null;
-
-let authState = null;
-let saveCreds = null;
-
-async function init() {
-    const authInfo = await useMultiFileAuthState('auth_info_baileys');
-    authState = authInfo.state;
-    saveCreds = authInfo.saveCreds;
-
-    async function connectToWhatsApp() {
-        if (sock) {
-            try {
-                await sock.logout();
-            } catch (err) {
-                console.log('Error logging out:', err);
-            }
-        }
-
-
-sock = makeWASocket({
-    auth: authState,
-    printQRInTerminal: true,
-    syncFullHistory: true,
-    logger: P({ level: 'silent' }),
-    shouldIgnoreJid: jid => {
-        if (!jid || typeof jid !== 'string') return true;
-        return jid.startsWith('status@broadcast') || jid.includes('spam');
-    },
-    patchMessageBeforeSending: (message) => {
-        const requiresPatch = !!(
-            message.buttonsMessage ||
-            message.templateMessage ||
-            message.listMessage
-        );
-        if (requiresPatch) {
-            message = {
-                viewOnceMessage: {
-                    message: {
-                        messageContextInfo: {
-                            deviceListMetadataVersion: 2,
-                            deviceListMetadata: {}
-                        },
-                        ...message,
-                    },
-                },
-            };
-        }
-        return message;
-    }
-});
-
-
-
-sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-        console.log('📱 QR Code recebido. Gerando imagem...');
-        const qrCodeImage = qrImage.imageSync(qr, { type: 'png' });
-        const qrPath = path.join(__dirname, 'qr-code.png');
-        fs.writeFileSync(qrPath, qrCodeImage);
-        console.log('✅ QR Code salvo em:', qrPath);
-    }
-
-    switch (connection) {
-        case 'open':
-            isWhatsAppConnected = true;
-            console.log('✅ Conectado com sucesso ao WhatsApp');
-            break;
-
-        case 'close':
-            isWhatsAppConnected = false;
-
-            const isLoggedOut = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
-            const shouldReconnect = !isLoggedOut;
-
-            console.warn(`⚠️ Conexão com o WhatsApp fechada. Reconnect? ${shouldReconnect}`);
-
-            if (shouldReconnect) {
-                console.log('⏳ Aguardando 10 segundos antes de tentar reconectar...');
-                setTimeout(async () => {
-                    try {
-                        await connectToWhatsApp();
-                        console.log('🔄 Tentativa de reconexão realizada');
-                    } catch (err) {
-                        console.error('❌ Falha ao tentar reconectar:', err.message);
-                    }
-                }, 10000);
-            } else {
-                console.log('🛑 Sessão encerrada (logout). Apague a pasta auth_info_baileys para reconectar.');
-            }
-            break;
-
-        default:
-            console.log(`ℹ️ Estado da conexão: ${connection}`);
-    }
-});
-
-
-
-
-
-
-
-sock.ev.on('creds.update', saveCreds);
-
-let sessionWasOpen = false;
-
-
-
-
-        sock.ev.on('connection.error', async (error) => {
-            console.log('Connection error', error);
-            console.log('Reconnecting...');
-            await connectToWhatsApp();
-        });
-sock.ev.on('messages.upsert', async (msg) => {
-    console.log('📥 Nova mensagem recebida:', msg.type);
-
-    const { messages } = msg;
-
-    for (let message of messages) {
-        if (!message.message) {
-            console.warn('⚠️ Mensagem ignorada: conteúdo criptografado ou sessão ausente');
-            continue;
-        }
-
-        try {
-            const groupId = message.key?.remoteJid || null;
-            const senderId = message.key?.participant || null;
-
-            if (!groupId || !groupId.endsWith('@g.us')) {
-                console.log('📭 Ignorado: mensagem não é de grupo.');
-                continue;
-            }
-
-            try {
-                await getGroupMetadataSafe(groupId);
-                console.log(`🔁 Metadados sincronizados (com cache) para o grupo ${groupId}`);
-            } catch (metaErr) {
-                console.warn(`⚠️ Falha ao sincronizar grupo ${groupId}: ${metaErr.message}`);
-            }
-
-            const conversation = message.message?.conversation || '';
-            const extendedText = message.message?.extendedTextMessage?.text || '';
-            const imageMessage = message.message?.imageMessage || null;
-            const videoMessage = message.message?.videoMessage || null;
-            const documentMessage = message.message?.documentMessage || null;
-            const audioMessage = message.message?.audioMessage || null;
-
-            const timestamp = Number(message.messageTimestamp) || null;
-            const profilePictureUrl = ''; // Pode ser preenchido com await sock.profilePictureUrl(senderId)
-            const text = conversation || extendedText || null;
-
-            const truncateUrl = (url) => url?.length > 2048 ? url.substring(0, 2048) : url;
-
-            const imageUrl = truncateUrl(imageMessage?.url) || null;
-            const videoUrl = truncateUrl(videoMessage?.url) || null;
-            const documentUrl = truncateUrl(documentMessage?.url) || null;
-            const audioUrl = truncateUrl(audioMessage?.url) || null;
-
-            const connection = await dbPool.getConnection();
-            await connection.execute(
-                'INSERT INTO messages1 (group_id, sender_id, message, image_url, video_url, document_url, audio_url, timestamp, profile_picture_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                [
-                    groupId, senderId, text,
-                    imageUrl, videoUrl, documentUrl, audioUrl,
-                    timestamp, profilePictureUrl
-                ]
-            );
-            connection.release();
-
-            console.log(`✅ Mensagem salva com sucesso no grupo ${groupId}`);
-
-            broadcastLiveMessage({
-                groupId,
-                senderId,
-                text,
-                imageUrl,
-                videoUrl,
-                documentUrl,
-                audioUrl,
-                timestamp,
-                profile_picture_url: profilePictureUrl
-            });
-
-            global.broadcastLiveMessage = broadcastLiveMessage;
-
-        } catch (error) {
-            console.error('❌ Erro ao processar mensagem:', error.message);
-        }
-    }
-});
-
-
-
-    }
-
+(async () => {
+    // Iniciar conexão com WhatsApp
     await connectToWhatsApp();
-        
-        
+    console.log('🚀 Inicialização do WhatsApp concluída');
+})();
         const reprocessAllFailedMessages = async () => {
     try {
         const failedMessages = await safeQuery(
@@ -415,6 +138,7 @@ setInterval(reprocessFailedMessages, 300000); // Reprocessa a cada 5 minutos
 
 const sendBatchMessages = async (messages) => {
     const delay = 2000;
+    const sock = getSock(); // Obter instância atual do socket
 
     for (let msg of messages) {
         try {
@@ -449,6 +173,14 @@ const sendBatchMessages = async (messages) => {
 const processQueue = async () => {
   while (true) {
     try {
+      // Verificar conexão com banco
+      const dbPool = getDbPool();
+      if (!dbPool) {
+        console.log('⚠️ Conexão com banco não disponível. Tentando novamente em 5s...');
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        continue;
+      }
+      
       const rawMessage = await redis.rpop('message_queue');
 
       if (!rawMessage) {
@@ -458,6 +190,15 @@ const processQueue = async () => {
 
       const msg = JSON.parse(rawMessage);
       const { userId, groupId, caption, column, scheduledTime } = msg;
+      const sock = getSock(); // Obter a instância atual do socket
+
+      // Verificar conexão WhatsApp
+      if (!sock || !sock.ws || sock.ws.readyState !== 1) {
+        console.log('⚠️ Conexão WhatsApp não disponível. Reenfileirando mensagem...');
+        await redis.lpush('message_queue', rawMessage); // Colocar de volta na fila
+        await new Promise(resolve => setTimeout(resolve, 10000));
+        continue;
+      }
 
       // Fallback para recuperar o filePath correto
       const finalFilePath = msg.filePath || msg.image_url || msg.video_url || msg.document_url || msg.audio_url;
@@ -469,6 +210,16 @@ const processQueue = async () => {
 
       if (!userId || !groupId || !finalFilePath || !finalColumn) {
         console.error(`❌ Parâmetros ausentes ou inválidos: ${JSON.stringify(msg)}`);
+        continue;
+      }
+
+      // Verificar se arquivo existe
+      if (!fs.existsSync(finalFilePath)) {
+        console.error(`❌ Arquivo não encontrado: ${finalFilePath}`);
+        await safeQuery(
+          'UPDATE messages_queue SET status = ?, error = ? WHERE user_id = ? AND group_id = ? AND (image_url = ? OR video_url = ? OR audio_url = ? OR document_url = ?)',
+          ['failed', 'Arquivo não encontrado', userId, groupId, msg.image_url, msg.video_url, msg.audio_url, msg.document_url]
+        );
         continue;
       }
 
@@ -488,12 +239,10 @@ const processQueue = async () => {
         await sock.sendMessage(groupId, payload);
         console.log(`✅ Mensagem enviada para grupo ${groupId}`);
 
-        const connection = await dbPool.getConnection();
-        await connection.execute(
+        await safeQuery(
           'UPDATE messages_queue SET status = ?, error = NULL WHERE user_id = ? AND group_id = ? AND (image_url = ? OR video_url = ? OR audio_url = ? OR document_url = ?)',
           ['sent', userId, groupId, msg.image_url, msg.video_url, msg.audio_url, msg.document_url]
         );
-        connection.release();
 
       } catch (sendError) {
         console.error(`❌ Erro ao enviar para grupo ${groupId}: ${sendError.message}`);
@@ -504,29 +253,46 @@ const processQueue = async () => {
           await new Promise(r => setTimeout(r, 10000));
 
           try {
-            await sock.sendMessage(groupId, payload);
+            const reconnectedSock = getSock();
+            await reconnectedSock.sendMessage(groupId, payload);
             console.log(`✅ Reenvio bem-sucedido após reconexão para ${groupId}`);
+            
+            await safeQuery(
+              'UPDATE messages_queue SET status = ?, error = NULL WHERE user_id = ? AND group_id = ? AND (image_url = ? OR video_url = ? OR audio_url = ? OR document_url = ?)',
+              ['sent', userId, groupId, msg.image_url, msg.video_url, msg.audio_url, msg.document_url]
+            );
           } catch (finalError) {
             console.error(`❌ Falha após reconexão: ${finalError.message}`);
+            
+            await safeQuery(
+              'UPDATE messages_queue SET status = ?, error = ? WHERE user_id = ? AND group_id = ? AND (image_url = ? OR video_url = ? OR audio_url = ? OR document_url = ?)',
+              [
+                'failed',
+                finalError.message ?? 'Erro após reconexão',
+                userId ?? null,
+                groupId ?? null,
+                msg.image_url ?? null,
+                msg.video_url ?? null,
+                msg.audio_url ?? null,
+                msg.document_url ?? null
+              ]
+            );
           }
+        } else {
+          await safeQuery(
+            'UPDATE messages_queue SET status = ?, error = ? WHERE user_id = ? AND group_id = ? AND (image_url = ? OR video_url = ? OR audio_url = ? OR document_url = ?)',
+            [
+              'failed',
+              sendError.message ?? 'Erro desconhecido',
+              userId ?? null,
+              groupId ?? null,
+              msg.image_url ?? null,
+              msg.video_url ?? null,
+              msg.audio_url ?? null,
+              msg.document_url ?? null
+            ]
+          );
         }
-
-        const connection = await dbPool.getConnection();
-       await connection.execute(
-  'UPDATE messages_queue SET status = ?, error = ? WHERE user_id = ? AND group_id = ? AND (image_url = ? OR video_url = ? OR audio_url = ? OR document_url = ?)',
-  [
-    'failed',
-    sendError.message ?? 'Erro desconhecido',
-    userId ?? null,
-    groupId ?? null,
-    msg.image_url ?? null,
-    msg.video_url ?? null,
-    msg.audio_url ?? null,
-    msg.document_url ?? null
-  ]
-);
-
-        connection.release();
       }
 
     } catch (err) {
@@ -547,47 +313,103 @@ processQueue();
 
    const processMessages = async () => {
     try {
-        const connection = await dbPool.getConnection();
-        console.log('Conexão com o banco de dados estabelecida');
+        console.log('🔄 Verificando mensagens agendadas e pendentes...');
 
         // Seleciona mensagens com status 'scheduled' e verifica se é hora de mudar para 'pending'
-        const [scheduledRows] = await connection.execute('SELECT * FROM messages_queue WHERE status = ? AND scheduled_time <= NOW()', ['scheduled']);
-        console.log(`Mensagens agendadas encontradas: ${scheduledRows.length}`);
+        const scheduledRows = await safeQuery(
+            'SELECT * FROM messages_queue WHERE status = ? AND scheduled_time <= NOW()', 
+            ['scheduled']
+        );
+        console.log(`📅 Mensagens agendadas encontradas: ${scheduledRows.length}`);
 
         for (let message of scheduledRows) {
-            await connection.execute('UPDATE messages_queue SET status = ? WHERE id = ?', ['pending', message.id]);
-            console.log(`Mensagem ID ${message.id} mudada para 'pending'`);
+            await safeQuery(
+                'UPDATE messages_queue SET status = ? WHERE id = ?', 
+                ['pending', message.id]
+            );
+            console.log(`🔔 Mensagem ID ${message.id} mudada para 'pending'`);
         }
 
         // Processa as mensagens pendentes
-        const [rows] = await connection.execute('SELECT * FROM messages_queue WHERE status = ? LIMIT 500', ['pending']);
-        connection.release();
-        console.log(`Mensagens pendentes encontradas: ${rows.length}`);
+        const rows = await safeQuery(
+            'SELECT * FROM messages_queue WHERE status = ? LIMIT 500', 
+            ['pending']
+        );
+        console.log(`📨 Mensagens pendentes encontradas: ${rows.length}`);
+
+        // Obter socket atual
+        const sock = getSock();
+        if (!sock || !sock.ws || sock.ws.readyState !== 1) {
+            console.log('⚠️ WhatsApp não conectado. Pulando processamento de mensagens.');
+            return;
+        }
+
+        const getGroupMetadataSafe = async (jid) => {
+            try {
+                // Verificar formato do JID
+                if (!jid.endsWith('@g.us') && !jid.endsWith('@s.whatsapp.net')) {
+                    return null;
+                }
+                
+                return await sock.groupMetadata(jid).catch(() => null);
+            } catch (err) {
+                console.warn(`⚠️ Erro ao obter metadados do grupo ${jid}:`, err.message);
+                return null;
+            }
+        };
 
         for (let message of rows) {
             try {
-                console.log(`Processando mensagem ID: ${message.id}, Group ID: ${message.group_id}`);
-await getGroupMetadataSafe(message.group_id);
-                console.log(`Metadata do grupo obtida para o Group ID: ${message.group_id}`);
+                console.log(`🔄 Processando mensagem ID: ${message.id}, Group ID: ${message.group_id}`);
+                
+                // Verificar se grupo existe
+                await getGroupMetadataSafe(message.group_id);
+                console.log(`✅ Metadata do grupo obtida para o Group ID: ${message.group_id}`);
 
-                await sock.sendMessage(message.group_id, { image: { url: message.image_url }, caption: message.caption });
-                console.log(`Mensagem enviada para o grupo: ${message.group_id}`);
+                // Determinar tipo de mídia
+                let payload;
+                if (message.image_url) {
+                    payload = { image: { url: message.image_url }, caption: message.caption };
+                } else if (message.video_url) {
+                    payload = { video: { url: message.video_url }, caption: message.caption };
+                } else if (message.audio_url) {
+                    payload = { audio: { url: message.audio_url } };
+                } else if (message.document_url) {
+                    payload = { document: { url: message.document_url }, caption: message.caption };
+                } else {
+                    // Sem mídia, enviar texto
+                    payload = { text: message.caption || 'Sem conteúdo' };
+                }
 
-                const connection = await dbPool.getConnection();
-                await connection.execute('UPDATE messages_queue SET status = ? WHERE id = ?', ['sent', message.id]);
-                connection.release();
-                console.log(`Status da mensagem ID ${message.id} atualizado para 'sent'`);
+                // Verificar se arquivo existe quando é mídia
+                const mediaPath = message.image_url || message.video_url || message.audio_url || message.document_url;
+                if (mediaPath && !fs.existsSync(mediaPath)) {
+                    throw new Error(`Arquivo não encontrado: ${mediaPath}`);
+                }
+
+                // Enviar mensagem
+                await sock.sendMessage(message.group_id, payload);
+                console.log(`✅ Mensagem enviada para o grupo: ${message.group_id}`);
+
+                // Atualizar status
+                await safeQuery(
+                    'UPDATE messages_queue SET status = ? WHERE id = ?', 
+                    ['sent', message.id]
+                );
+                console.log(`✅ Status da mensagem ID ${message.id} atualizado para 'sent'`);
             } catch (error) {
-                console.error(`Erro ao enviar mensagem para o grupo ${message.group_id}:`, error);
+                console.error(`❌ Erro ao enviar mensagem para o grupo ${message.group_id}:`, error);
 
-                const connection = await dbPool.getConnection();
-                await connection.execute('UPDATE messages_queue SET status = ?, error = ? WHERE id = ?', ['failed', error.message, message.id]);
-                connection.release();
-                console.log(`Status da mensagem ID ${message.id} atualizado para 'failed' com erro: ${error.message}`);
+                // Atualizar status com erro
+                await safeQuery(
+                    'UPDATE messages_queue SET status = ?, error = ? WHERE id = ?', 
+                    ['failed', error.message, message.id]
+                );
+                console.log(`❌ Status da mensagem ID ${message.id} atualizado para 'failed' com erro: ${error.message}`);
             }
         }
     } catch (error) {
-        console.error('Erro ao processar mensagens:', error);
+        console.error('❌ Erro ao processar mensagens:', error);
     }
 };
 
@@ -808,6 +630,7 @@ app.get('/health', async (req, res) => {
 
     try {
         // Testar conexão com o WhatsApp
+        const sock = getSock(); // Obter instância atual do socket
         status.whatsapp = sock && sock.ws && sock.ws.readyState === 1;
     } catch (err) {
         console.error('Erro ao verificar WhatsApp:', err.message);
@@ -1493,8 +1316,8 @@ app.get('/history', verifyJWT, async (req, res) => {
         }
     });
 
-    const jwt = require('jsonwebtoken');
-const SECRET_KEY = process.env.JWT_SECRET || 'sua-chave-secreta';
+    // const jwt = require('jsonwebtoken');
+// SECRET_KEY já foi declarado anteriormente
 
 app.post('/login', async (req, res) => {
   const { email, password } = req.body;
@@ -2110,45 +1933,8 @@ app.post('/forcar-disparos', verifyJWT, async (req, res) => {
    http.listen(5175, () => {
     console.log('Server is running on port 5175');
 });
-}
+// ...existing code...
 
-// Chamando a função init para inicializar a aplicação
-// Chama a inicialização principal
-init().then(() => {
-    // Após init, reprocessa mensagens pendentes
-    (async () => {
-        try {
-            const connectionClosedMessages = await safeQuery(
-                "SELECT * FROM messages_queue WHERE status = 'failed' AND error LIKE '%Connection Closed%'"
-            );
-
-            for (let msg of connectionClosedMessages) {
-                const payload = {
-                    userId: msg.user_id,
-                    groupId: msg.group_id,
-                    filePath: msg.file_path || msg.image_url || msg.video_url || msg.document_url || msg.audio_url,
-                    caption: msg.caption,
-                    column: msg.image_url ? 'image_url' :
-                            msg.video_url ? 'video_url' :
-                            msg.document_url ? 'document_url' :
-                            msg.audio_url ? 'audio_url' : null,
-                    status: msg.status,
-                    scheduledTime: msg.scheduled_time
-                };
-
-                if (payload.filePath && payload.column) {
-                    await redis.lpush('message_queue', JSON.stringify(payload));
-                }
-            }
-
-            console.log(`🔄 ${connectionClosedMessages.length} mensagens com erro 'Connection Closed' reenfileiradas ao iniciar.`);
-        } catch (err) {
-            console.error('❌ Erro ao reenfileirar mensagens com erro:', err);
-        }
-    })();
-}).catch(err => {
-    console.error('❌ Erro ao inicializar o sistema:', err);
-});
 
 
 
