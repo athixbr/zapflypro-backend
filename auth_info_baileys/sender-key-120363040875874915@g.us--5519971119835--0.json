@@ -1,0 +1,12 @@
+[
+  {
+    "senderKeyId": 82628666,
+    "senderChainKey": {
+      "iteration": 6,
+      "seed": "mpzhli71hAvuflVQhWYHQa3RRMILT+aOE9BxfdW3kdQ="
+    },
+    "senderSigningKey": {
+      "public": "BSQjYJmiXBKdS187sbUnhII8VkcM8yYKqbzALEDpoEwA"
+    }
+  }
+]

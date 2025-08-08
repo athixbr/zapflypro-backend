@@ -746,15 +746,43 @@ function broadcastLiveMessage(data) {
 
 
 
+
+// Rota única e precisa para /qr-page
 app.get('/qr-page', (req, res) => {
     const qrPath = path.join(__dirname, 'qr-code.png');
+    let statusMsg = '<span style="color: orange;">⏳ Conectando...</span>';
+    let isConnected = false;
+    // Usa o global setado pelo connectToWhatsApp
+    if (global.isWhatsAppConnected) {
+        statusMsg = '<span style="color: green;">✅ WhatsApp conectado!</span>';
+        isConnected = true;
+    } else {
+        statusMsg = '<span style="color: red;">❌ WhatsApp não conectado</span>';
+    }
 
+    // Se está conectado, mostra imediatamente
+    if (isConnected) {
+        return res.send(`
+            <html>
+                <body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;">
+                    <div style="text-align:center;">
+                        <h2>${statusMsg}</h2>
+                        <p>O WhatsApp já está conectado. Você pode fechar esta página.</p>
+                        <button onclick="location.reload()">🔄 Atualizar Status</button>
+                    </div>
+                </body>
+            </html>
+        `);
+    }
+
+    // Se não está conectado, mostra o QR se existir
     if (!fs.existsSync(qrPath)) {
         return res.send(`
             <html>
                 <body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;">
                     <div>
                         <h2>⚠️ QR Code ainda não foi gerado.</h2>
+                        <div style="margin-bottom:10px;">Status: ${statusMsg}</div>
                         <p>Certifique-se de que a sessão foi encerrada e aguarde alguns segundos...</p>
                         <button onclick="location.reload()">🔄 Recarregar</button>
                     </div>
@@ -770,6 +798,7 @@ app.get('/qr-page', (req, res) => {
             <body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f4;">
                 <div style="text-align:center;">
                     <h2>📱 Escaneie o QR Code abaixo:</h2>
+                    <div style="margin-bottom:10px;">Status: ${statusMsg}</div>
                     <img src="/qr?t=${timestamp}" alt="QR Code" style="border:1px solid #000;" />
                     <br><br>
                     <button onclick="location.reload()">🔄 Atualizar QR</button>
@@ -841,71 +870,64 @@ app.get('/qr', (req, res) => {
         }
     });
     
-app.get('/me', verifyJWT, async (req, res) => {
-  try {
-    const userId = req.userId;
-    const connection = await dbPool.getConnection();
-
-    const [rows] = await connection.execute(`
-      SELECT id, email, plan_name, plan_due_date, payment_status
-      FROM users
-      WHERE id = ?
-    `, [userId]);
-
-    connection.release();
-
-    if (rows.length > 0) {
-      const user = rows[0];
-      res.json({
-        id: user.id,
-        email: user.email,
-        plan_name: user.plan_name || null,
-        plan_due_date: user.plan_due_date || null,
-        payment_status: user.payment_status || null
-      });
+app.get('/qr-page', (req, res) => {
+    const qrPath = path.join(__dirname, 'qr-code.png');
+    const sock = getSock && getSock();
+    let statusMsg = '<span style="color: orange;">⏳ Conectando...</span>';
+    let isConnected = false;
+    if (sock && sock.ws && sock.ws.readyState === 1) {
+        statusMsg = '<span style="color: green;">✅ WhatsApp conectado!</span>';
+        isConnected = true;
     } else {
-      res.status(404).json({ error: 'Usuário não encontrado' });
+        statusMsg = '<span style="color: red;">❌ WhatsApp não conectado</span>';
     }
-  } catch (error) {
-    console.error('Erro ao buscar dados do usuário:', error);
-    res.status(500).json({ error: 'Erro ao buscar perfil do usuário' });
-  }
-});
 
-
-
-app.post('/reprocess-failed', verifyJWT, async (req, res) => {
-    try {
-        const failedMessages = await safeQuery(
-            `SELECT * FROM messages_queue WHERE status = 'failed' ORDER BY id DESC LIMIT 1000`
-        );
-
-        if (!failedMessages.length) {
-            return res.json({ status: 'ok', mensagem: 'Nenhuma mensagem com erro encontrada.' });
-        }
-
-        let count = 0;
-
-        for (let msg of failedMessages) {
-            const payload = {
-                userId: msg.user_id,
-                groupId: msg.group_id,
-                filePath: msg.file_path,
-                caption: msg.caption,
-                column: msg.image_url ? 'image_url' : msg.video_url ? 'video_url' : 'file_path',
-                status: msg.status,
-                scheduledTime: msg.scheduled_time
-            };
-
-            await redis.lpush('message_queue', JSON.stringify(payload));
-            count++;
-        }
-
-        res.json({ status: 'success', reenfileiradas: count });
-    } catch (error) {
-        console.error('❌ Erro ao reprocessar mensagens com erro:', error);
-        res.status(500).send('Erro ao reprocessar mensagens com status failed.');
+    // Se está conectado, mostra imediatamente
+    if (isConnected) {
+        return res.send(`
+            <html>
+                <body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;">
+                    <div style="text-align:center;">
+                        <h2>${statusMsg}</h2>
+                        <p>O WhatsApp já está conectado. Você pode fechar esta página.</p>
+                        <button onclick="location.reload()">🔄 Atualizar Status</button>
+                    </div>
+                </body>
+            </html>
+        `);
     }
+
+    // Se não está conectado, mostra o QR se existir
+    if (!fs.existsSync(qrPath)) {
+        return res.send(`
+            <html>
+                <body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;">
+                    <div>
+                        <h2>⚠️ QR Code ainda não foi gerado.</h2>
+                        <div style="margin-bottom:10px;">Status: ${statusMsg}</div>
+                        <p>Certifique-se de que a sessão foi encerrada e aguarde alguns segundos...</p>
+                        <button onclick="location.reload()">🔄 Recarregar</button>
+                    </div>
+                </body>
+            </html>
+        `);
+    }
+
+    const timestamp = Date.now();
+
+    res.send(`
+        <html>
+            <body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f4;">
+                <div style="text-align:center;">
+                    <h2>📱 Escaneie o QR Code abaixo:</h2>
+                    <div style="margin-bottom:10px;">Status: ${statusMsg}</div>
+                    <img src="/qr?t=${timestamp}" alt="QR Code" style="border:1px solid #000;" />
+                    <br><br>
+                    <button onclick="location.reload()">🔄 Atualizar QR</button>
+                </div>
+            </body>
+        </html>
+    `);
 });
 
 app.get('/contact-messages/:jid', verifyJWT, async (req, res) => {
